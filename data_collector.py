@@ -59,11 +59,11 @@ def fetch_eia_gas_prices(api_key: str, years: int = DEFAULT_HISTORY_YEARS) -> pd
     data = response.json()
 
     if "response" not in data or "data" not in data["response"]:
-        return _fetch_eia_v1(api_key, years)
+        return _fetch_eia_v2_fallback(api_key, years)
 
     records = data["response"]["data"]
     if not records:
-        return _fetch_eia_v1(api_key, years)
+        return _fetch_eia_v2_fallback(api_key, years)
 
     df = pd.DataFrame(records)
     df["date"] = pd.to_datetime(df["period"])
@@ -72,20 +72,25 @@ def fetch_eia_gas_prices(api_key: str, years: int = DEFAULT_HISTORY_YEARS) -> pd
     return df
 
 
-def _fetch_eia_v1(api_key: str, years: int = DEFAULT_HISTORY_YEARS) -> pd.DataFrame:
-    """Fallback to EIA API v1."""
-    url = f"https://api.eia.gov/series/?api_key={api_key}&series_id={EIA_RETAIL_GAS}"
-    response = requests.get(url, timeout=30)
+def _fetch_eia_v2_fallback(api_key: str, years: int = DEFAULT_HISTORY_YEARS) -> pd.DataFrame:
+    """Fallback: fetch retail gas prices via EIA API v2 seriesid endpoint."""
+    url = f"https://api.eia.gov/v2/seriesid/{EIA_RETAIL_GAS}"
+    params = {
+        "api_key": api_key,
+        "data[0]": "value",
+        "length": 5000,
+    }
+    response = requests.get(url, params=params, timeout=30)
     response.raise_for_status()
     data = response.json()
 
-    if "series" not in data or not data["series"]:
+    if "response" not in data or "data" not in data["response"] or not data["response"]["data"]:
         raise ValueError("No data returned from EIA API. Check your API key.")
 
-    series_data = data["series"][0]["data"]
-    df = pd.DataFrame(series_data, columns=["date_str", "gas_price"])
-    df["date"] = pd.to_datetime(df["date_str"])
-    df["gas_price"] = pd.to_numeric(df["gas_price"], errors="coerce")
+    records = data["response"]["data"]
+    df = pd.DataFrame(records)
+    df["date"] = pd.to_datetime(df["period"])
+    df["gas_price"] = pd.to_numeric(df["value"], errors="coerce")
 
     cutoff = datetime.now() - timedelta(days=365 * years)
     df = df[df["date"] >= cutoff].sort_values("date").reset_index(drop=True)
@@ -98,23 +103,25 @@ def fetch_eia_weekly_series(
     col_name: str,
     years: int = DEFAULT_HISTORY_YEARS,
 ) -> pd.DataFrame:
-    """Fetch a single EIA weekly petroleum series via API v1 series endpoint."""
-    url = (
-        f"https://api.eia.gov/series/"
-        f"?api_key={api_key}&series_id=PET.{series_id}.W"
-    )
+    """Fetch a single EIA weekly petroleum series via API v2 seriesid endpoint."""
+    url = f"https://api.eia.gov/v2/seriesid/PET.{series_id}.W"
+    params = {
+        "api_key": api_key,
+        "data[0]": "value",
+        "length": 5000,
+    }
     try:
-        response = requests.get(url, timeout=30)
+        response = requests.get(url, params=params, timeout=30)
         response.raise_for_status()
         data = response.json()
 
-        if "series" not in data or not data["series"]:
+        if "response" not in data or "data" not in data["response"] or not data["response"]["data"]:
             return pd.DataFrame(columns=["date", col_name])
 
-        series_data = data["series"][0]["data"]
-        df = pd.DataFrame(series_data, columns=["date_str", col_name])
-        df["date"] = pd.to_datetime(df["date_str"])
-        df[col_name] = pd.to_numeric(df[col_name], errors="coerce")
+        records = data["response"]["data"]
+        df = pd.DataFrame(records)
+        df["date"] = pd.to_datetime(df["period"])
+        df[col_name] = pd.to_numeric(df["value"], errors="coerce")
 
         cutoff = datetime.now() - timedelta(days=365 * years)
         df = df[df["date"] >= cutoff].sort_values("date").reset_index(drop=True)
@@ -274,6 +281,10 @@ def fetch_all_fred_data(
 #  COMBINED DATASET
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _snap_to_sunday(dates: pd.Series) -> pd.Series:
+    """Snap all dates to the Sunday ending their ISO week."""
+    return dates + pd.to_timedelta((6 - dates.dt.dayofweek) % 7, unit="D")
+
 def build_combined_dataset(
     eia_api_key: str,
     fred_api_key: str = "",
@@ -295,15 +306,15 @@ def build_combined_dataset(
     print("Fetching FRED economic data...")
     fred_df = fetch_all_fred_data(fred_api_key, years=years)
 
-    # Align everything to weekly Sunday dates
-    gas_df["date"] = gas_df["date"].dt.to_period("W").dt.to_timestamp("W")
-    market_df["date"] = market_df["date"].dt.to_period("W").dt.to_timestamp("W")
+    # Snap all dates to week-ending Sunday for consistent alignment
+    gas_df["date"] = _snap_to_sunday(gas_df["date"])
+    market_df["date"] = _snap_to_sunday(market_df["date"])
 
     if not eia_sd_df.empty and "date" in eia_sd_df.columns:
-        eia_sd_df["date"] = eia_sd_df["date"].dt.to_period("W").dt.to_timestamp("W")
+        eia_sd_df["date"] = _snap_to_sunday(eia_sd_df["date"])
 
     if not fred_df.empty and "date" in fred_df.columns:
-        fred_df["date"] = fred_df["date"].dt.to_period("W").dt.to_timestamp("W")
+        fred_df["date"] = _snap_to_sunday(fred_df["date"])
 
     # Merge all datasets
     combined = pd.merge(gas_df, market_df, on="date", how="inner")
