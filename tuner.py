@@ -24,7 +24,8 @@ from config import (
     DEFAULT_XGBOOST_PARAMS,
     MIN_TRAINING_WEEKS,
     TUNING_N_TRIALS,
-    TUNING_TIMEOUT,
+    TUNING_TIMEOUT_PER_TRIAL,
+    TUNING_MAX_TIMEOUT,
 )
 
 # Suppress Optuna's verbose logging
@@ -205,7 +206,7 @@ def _objective(trial, X, y_chg, y_abs, bases, names) -> float:
 def run_tuning(
     df,
     n_trials: int = TUNING_N_TRIALS,
-    timeout: int = TUNING_TIMEOUT,
+    timeout: int = min(TUNING_N_TRIALS * TUNING_TIMEOUT_PER_TRIAL, TUNING_MAX_TIMEOUT),
     callback: Optional[Callable] = None,
 ) -> dict:
     """

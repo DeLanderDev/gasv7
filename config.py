@@ -103,6 +103,7 @@ DEFAULT_HISTORY_YEARS = 5
 
 # ─── Hyperparameter Tuning ──────────────────────────────────────────────────
 TUNING_N_TRIALS = 40
-TUNING_TIMEOUT = 300  # seconds
+TUNING_TIMEOUT_PER_TRIAL = 45  # seconds per trial
+TUNING_MAX_TIMEOUT = 3600  # absolute max (1 hour)
 BEST_PARAMS_FILE = MODEL_DIR / "best_hyperparams.json"
 BIAS_HISTORY_FILE = DATA_DIR / "bias_history.json"

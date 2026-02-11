@@ -15,7 +15,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 
-from config import DEFAULT_HISTORY_YEARS, MIN_DATA_POINTS, TUNING_N_TRIALS, TUNING_TIMEOUT
+from config import DEFAULT_HISTORY_YEARS, MIN_DATA_POINTS, TUNING_N_TRIALS, TUNING_TIMEOUT_PER_TRIAL, TUNING_MAX_TIMEOUT
 from data_collector import build_combined_dataset
 from feature_engine import create_features, get_feature_columns
 from model import GasPriceModel
@@ -110,13 +110,12 @@ with st.sidebar:
             "Optuna trials", min_value=10, max_value=80,
             value=TUNING_N_TRIALS, step=10,
         )
-        tuning_timeout = st.slider(
-            "Timeout (seconds)", min_value=60, max_value=600,
-            value=TUNING_TIMEOUT, step=60,
-        )
+        tuning_timeout = min(n_trials * TUNING_TIMEOUT_PER_TRIAL, TUNING_MAX_TIMEOUT)
+        st.caption(f"Timeout: {tuning_timeout // 60}m {tuning_timeout % 60}s "
+                   f"({TUNING_TIMEOUT_PER_TRIAL}s per trial)")
     else:
         n_trials = TUNING_N_TRIALS
-        tuning_timeout = TUNING_TIMEOUT
+        tuning_timeout = min(n_trials * TUNING_TIMEOUT_PER_TRIAL, TUNING_MAX_TIMEOUT)
 
     # ── About ─────────────────────────────────────────────────────────────
     st.markdown("---")
@@ -252,9 +251,11 @@ if enable_tuning:
                 progress_callback=_tuning_callback,
             )
             tuning_progress.empty()
+            actual = model.tuning_results['n_trials']
+            suffix = "" if actual >= n_trials else f" (timeout reached after {actual}/{n_trials})"
             tuning_status.success(
-                f"Tuning complete: {model.tuning_results['n_trials']} trials, "
-                f"best {model.tuning_results['best_value']:.1%} within 2 cents"
+                f"Tuning complete: {actual} trials, "
+                f"best {model.tuning_results['best_value']:.1%} within 2 cents{suffix}"
             )
         except Exception as e:
             tuning_progress.empty()
