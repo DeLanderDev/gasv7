@@ -233,17 +233,37 @@ def run_tuning(
     )
 
     def objective_wrapper(trial):
-        result = _objective(trial, X, y_chg, y_abs, bases, names)
-        if callback:
-            callback(trial.number + 1, n_trials, study.best_value)
-        return result
+        return _objective(trial, X, y_chg, y_abs, bases, names)
+
+    def _optuna_callback(study_obj, trial):
+        if callback and trial.state == optuna.trial.TrialState.COMPLETE:
+            callback(trial.number + 1, n_trials, study_obj.best_value)
 
     study.optimize(
         objective_wrapper,
         n_trials=n_trials,
         timeout=timeout,
+        callbacks=[_optuna_callback],
+        catch=(Exception,),
         show_progress_bar=False,
     )
+
+    # Guard: ensure at least one trial completed
+    completed = [
+        t for t in study.trials
+        if t.state == optuna.trial.TrialState.COMPLETE
+    ]
+    if not completed:
+        failed = [
+            t for t in study.trials
+            if t.state == optuna.trial.TrialState.FAIL
+        ]
+        msg = f"All {len(study.trials)} Optuna trials failed."
+        if failed:
+            reason = failed[0].system_attrs.get("fail_reason", "")
+            if reason:
+                msg += f" First failure: {reason}"
+        raise RuntimeError(msg)
 
     # Extract best params into structured format
     best = study.best_trial.params
