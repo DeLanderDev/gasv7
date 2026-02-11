@@ -235,7 +235,11 @@ def run_tuning(
     def objective_wrapper(trial):
         result = _objective(trial, X, y_chg, y_abs, bases, names)
         if callback:
-            callback(trial.number + 1, n_trials, study.best_value)
+            try:
+                best_val = max(study.best_value, result)
+            except ValueError:
+                best_val = result
+            callback(trial.number + 1, n_trials, best_val)
         return result
 
     study.optimize(
