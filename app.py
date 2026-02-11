@@ -15,7 +15,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 
-from config import DEFAULT_HISTORY_YEARS, MIN_DATA_POINTS
+from config import DEFAULT_HISTORY_YEARS, MIN_DATA_POINTS, TUNING_N_TRIALS, TUNING_TIMEOUT
 from data_collector import build_combined_dataset
 from feature_engine import create_features, get_feature_columns
 from model import GasPriceModel
@@ -95,6 +95,28 @@ with st.sidebar:
     )
 
     run_validation = st.checkbox("Run walk-forward validation", value=True)
+
+    # ── Hyperparameter Tuning ──────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Hyperparameter Tuning")
+    enable_tuning = st.checkbox(
+        "Run Optuna auto-tuning",
+        value=False,
+        help="Finds optimal model settings via Bayesian optimization. "
+             "Uses walk-forward validation to evaluate each trial.",
+    )
+    if enable_tuning:
+        n_trials = st.slider(
+            "Optuna trials", min_value=10, max_value=80,
+            value=TUNING_N_TRIALS, step=10,
+        )
+        tuning_timeout = st.slider(
+            "Timeout (seconds)", min_value=60, max_value=600,
+            value=TUNING_TIMEOUT, step=60,
+        )
+    else:
+        n_trials = TUNING_N_TRIALS
+        tuning_timeout = TUNING_TIMEOUT
 
     # ── About ─────────────────────────────────────────────────────────────
     st.markdown("---")
@@ -210,12 +232,41 @@ if data_age > 10:
 # ─── Model Training ──────────────────────────────────────────────────────────
 model = GasPriceModel()
 
-with st.spinner("🧠 Training prediction model..."):
-    try:
-        train_metrics = model.train(data)
-    except Exception as e:
-        st.error(f"❌ Error training model: {str(e)}")
-        st.stop()
+if enable_tuning:
+    tuning_status = st.empty()
+    tuning_progress = st.progress(0, text="Tuning hyperparameters...")
+
+    def _tuning_callback(trial_num, total, best_val):
+        pct = min(trial_num / total, 1.0)
+        tuning_progress.progress(
+            pct,
+            text=f"Trial {trial_num}/{total} | Best: {best_val:.1%} within 2 cents",
+        )
+
+    with st.spinner("Running Optuna hyperparameter tuning..."):
+        try:
+            train_metrics = model.tune_and_train(
+                data,
+                n_trials=n_trials,
+                timeout=tuning_timeout,
+                progress_callback=_tuning_callback,
+            )
+            tuning_progress.empty()
+            tuning_status.success(
+                f"Tuning complete: {model.tuning_results['n_trials']} trials, "
+                f"best {model.tuning_results['best_value']:.1%} within 2 cents"
+            )
+        except Exception as e:
+            tuning_progress.empty()
+            st.error(f"Tuning failed: {str(e)}")
+            st.stop()
+else:
+    with st.spinner("Training prediction model..."):
+        try:
+            train_metrics = model.train(data)
+        except Exception as e:
+            st.error(f"Error training model: {str(e)}")
+            st.stop()
 
 val_metrics = None
 val_results = None
@@ -544,6 +595,42 @@ with tab2:
             pd.DataFrame({"Metric": metrics_rows.keys(), "Value": metrics_rows.values()}),
             use_container_width=True, hide_index=True,
         )
+
+        # ── Tuning & Adaptive Bias Details ─────────────────────────────────
+        with st.expander("Hyperparameter Tuning & Adaptive Bias Details", expanded=False):
+            tuned = train_metrics.get("tuned", False)
+            st.markdown(f"**Tuned parameters active:** {'Yes' if tuned else 'No (using defaults)'}")
+
+            if model.tuning_results:
+                summary = model.tuning_results.get("study_summary", {})
+                tc1, tc2, tc3 = st.columns(3)
+                tc1.metric("Best Accuracy", f"{model.tuning_results['best_value']:.1%}")
+                tc2.metric("Trials Completed", summary.get("n_completed", "N/A"))
+                tc3.metric("Trials Pruned", summary.get("n_pruned", "N/A"))
+
+            # Adaptive bias info
+            st.markdown("---")
+            st.markdown("**Adaptive Bias Correction**")
+            bias_regime = train_metrics.get("bias_regime", "N/A")
+            bias_cal_window = train_metrics.get("bias_cal_window", "N/A")
+            raw_bias = train_metrics.get("bias_raw_bias", "N/A")
+            adaptive_bias = train_metrics.get("bias_adaptive_bias", "N/A")
+            cal_acc = train_metrics.get("bias_cal_accuracy_2c", "N/A")
+            history_n = train_metrics.get("bias_history_entries", 0)
+
+            bias_rows = {
+                "Market Regime": bias_regime,
+                "Calibration Window": f"{bias_cal_window} weeks" if bias_cal_window != "N/A" else "N/A",
+                "Raw Bias": f"${raw_bias}" if raw_bias != "N/A" else "N/A",
+                "Adaptive Bias": f"${adaptive_bias}" if adaptive_bias != "N/A" else "N/A",
+                "Cal. Window Accuracy": f"{cal_acc}%" if cal_acc != "N/A" else "N/A",
+                "History Entries": str(history_n),
+                "Ensemble Weights": str(train_metrics.get("ensemble_weights", "N/A")),
+            }
+            st.dataframe(
+                pd.DataFrame({"Setting": bias_rows.keys(), "Value": bias_rows.values()}),
+                use_container_width=True, hide_index=True,
+            )
     else:
         st.info("Enable **Walk-forward validation** in the sidebar to see accuracy metrics.")
 

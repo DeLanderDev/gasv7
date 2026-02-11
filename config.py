@@ -76,7 +76,7 @@ HURRICANE_PEAK_START_WEEK = 33     # Mid-Aug
 HURRICANE_PEAK_END_WEEK = 42       # Mid-Oct
 
 # ─── Model Settings ──────────────────────────────────────────────────────────
-XGBOOST_PARAMS = {
+DEFAULT_XGBOOST_PARAMS = {
     "n_estimators": 300,
     "max_depth": 4,
     "learning_rate": 0.05,
@@ -88,7 +88,21 @@ XGBOOST_PARAMS = {
     "random_state": 42,
 }
 
+# Backward-compatible alias
+XGBOOST_PARAMS = DEFAULT_XGBOOST_PARAMS
+
+DEFAULT_RIDGE_ALPHA = 1.0
+DEFAULT_ENSEMBLE_WEIGHTS = [0.40, 0.35, 0.25]
+DEFAULT_TOP_N = 35
+DEFAULT_RECENT_FRAC = 0.4
+
 VALIDATION_WEEKS = 26
 MIN_TRAINING_WEEKS = 52
 MIN_DATA_POINTS = 52
 DEFAULT_HISTORY_YEARS = 5
+
+# ─── Hyperparameter Tuning ──────────────────────────────────────────────────
+TUNING_N_TRIALS = 40
+TUNING_TIMEOUT = 300  # seconds
+BEST_PARAMS_FILE = MODEL_DIR / "best_hyperparams.json"
+BIAS_HISTORY_FILE = DATA_DIR / "bias_history.json"

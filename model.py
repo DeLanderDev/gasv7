@@ -7,8 +7,10 @@ Key design decisions:
   2. Triple ensemble: XGBoost-full + XGBoost-selected + Ridge
   3. Auto-calibrated shrinkage: dampens predictions toward zero
      because models consistently over-predict change magnitude.
-     Optimized to maximize the ±$0.02 accuracy rate.
+     Optimized to maximize the +/-$0.02 accuracy rate.
   4. Recent-data weighting: last 40% of data gets 2x weight
+  5. Optuna hyperparameter tuning (optional, via tune_and_train)
+  6. Adaptive bias correction with regime detection
 """
 
 import json
@@ -23,10 +25,18 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBRegressor
 
+from bias_tracker import BiasTracker
 from config import (
+    DEFAULT_ENSEMBLE_WEIGHTS,
+    DEFAULT_RECENT_FRAC,
+    DEFAULT_RIDGE_ALPHA,
+    DEFAULT_TOP_N,
+    DEFAULT_XGBOOST_PARAMS,
     METRICS_FILE,
     MIN_TRAINING_WEEKS,
     MODEL_FILE,
+    TUNING_N_TRIALS,
+    TUNING_TIMEOUT,
     VALIDATION_WEEKS,
     XGBOOST_PARAMS,
 )
@@ -35,6 +45,7 @@ from feature_engine import (
     get_feature_columns,
     prepare_prediction_row,
 )
+from tuner import load_best_params, run_tuning, save_best_params
 
 warnings.filterwarnings("ignore")
 
@@ -44,7 +55,7 @@ warnings.filterwarnings("ignore")
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _sample_weights(n: int, recent_frac: float = 0.4) -> np.ndarray:
-    """Recent data gets 2× weight; older data ramps from 0.5 → 1.0."""
+    """Recent data gets 2x weight; older data ramps from 0.5 -> 1.0."""
     w = np.ones(n)
     cut = int(n * (1 - recent_frac))
     w[:cut] = np.linspace(0.5, 1.0, cut)
@@ -52,9 +63,10 @@ def _sample_weights(n: int, recent_frac: float = 0.4) -> np.ndarray:
     return w
 
 
-def _top_features(X, y, names, top_n=35):
+def _top_features(X, y, names, top_n=35, xgb_params=None):
     """Quick XGBoost to rank features, return top N names."""
-    m = XGBRegressor(**{**XGBOOST_PARAMS, "n_estimators": 100})
+    p = xgb_params or DEFAULT_XGBOOST_PARAMS
+    m = XGBRegressor(**{**p, "n_estimators": 100})
     m.fit(X[names], y, verbose=False)
     fi = pd.Series(m.feature_importances_, index=names)
     return fi.sort_values(ascending=False).head(top_n).index.tolist()
@@ -67,10 +79,10 @@ def _calibrate_shrinkage(
     target_cents: float = 0.02,
 ) -> float:
     """
-    Find the shrinkage factor s ∈ [0, 1] that maximizes
-    the % of predictions within ±target_cents of actual.
-    
-    final_change = raw_change × s
+    Find the shrinkage factor s in [0, 1] that maximizes
+    the % of predictions within +/-target_cents of actual.
+
+    final_change = raw_change x s
     prediction   = base_price + final_change
     """
     best_s = 0.0
@@ -88,6 +100,13 @@ def _calibrate_shrinkage(
     return round(best_s, 2)
 
 
+def _normalize_weights(w1: float, w2: float):
+    """Normalize ensemble weights so they sum to 1, with w3 >= 0.05."""
+    w3 = max(1.0 - w1 - w2, 0.05)
+    total = w1 + w2 + w3
+    return [w1 / total, w2 / total, w3 / total]
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Model
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -98,12 +117,12 @@ class GasPriceModel:
 
     Sub-models:
       1. XGBoost on all features
-      2. XGBoost on top-35 features (less overfit)
-      3. Ridge on top-35 features (linear regularized)
+      2. XGBoost on top-N features (less overfit)
+      3. Ridge on top-N features (linear regularized)
 
     Pipeline:
-      raw_change = 0.40 × M1 + 0.35 × M2 + 0.25 × M3
-      final_change = raw_change × shrinkage
+      raw_change = w1 x M1 + w2 x M2 + w3 x M3
+      final_change = raw_change x shrinkage - bias
       prediction = current_price + final_change
     """
 
@@ -115,13 +134,19 @@ class GasPriceModel:
 
         self.all_features: List[str] = []
         self.sel_features: List[str] = []
-        self.ew = [0.40, 0.35, 0.25]  # ensemble weights
+        self.ew = list(DEFAULT_ENSEMBLE_WEIGHTS)
 
         self.shrinkage: float = 0.5  # auto-tuned in train()
         self.bias: float = 0.0       # auto-tuned in train()
         self.metrics: Dict = {}
         self.validation_results: Optional[pd.DataFrame] = None
         self.is_trained: bool = False
+
+        # Tuning & adaptive bias
+        self.bias_tracker = BiasTracker()
+        self.bias_metadata: Optional[Dict] = None
+        self.tuning_results: Optional[Dict] = None
+        self.hyperparams: Optional[Dict] = None
 
     # ─── Data Prep ────────────────────────────────────────────────────────
 
@@ -144,51 +169,115 @@ class GasPriceModel:
         p3 = self.ridge.predict(X_sc)
         return self.ew[0] * p1 + self.ew[1] * p2 + self.ew[2] * p3
 
+    # ─── Resolve Params ───────────────────────────────────────────────────
+
+    def _resolve_params(self, params: Optional[Dict] = None) -> Dict:
+        """Resolve hyperparameters from explicit params, or defaults."""
+        if params and "xgb_params" in params:
+            xgb_p = params["xgb_params"]
+            ridge_alpha = params.get("ridge_alpha", DEFAULT_RIDGE_ALPHA)
+            top_n = params.get("top_n", DEFAULT_TOP_N)
+            recent_frac = params.get("recent_frac", DEFAULT_RECENT_FRAC)
+            w1 = params.get("ensemble_w1", DEFAULT_ENSEMBLE_WEIGHTS[0])
+            w2 = params.get("ensemble_w2", DEFAULT_ENSEMBLE_WEIGHTS[1])
+            ew = _normalize_weights(w1, w2)
+        else:
+            xgb_p = dict(DEFAULT_XGBOOST_PARAMS)
+            ridge_alpha = DEFAULT_RIDGE_ALPHA
+            top_n = DEFAULT_TOP_N
+            recent_frac = DEFAULT_RECENT_FRAC
+            ew = list(DEFAULT_ENSEMBLE_WEIGHTS)
+
+        return {
+            "xgb_params": xgb_p,
+            "ridge_alpha": ridge_alpha,
+            "top_n": top_n,
+            "recent_frac": recent_frac,
+            "ew": ew,
+        }
+
     # ─── Training ─────────────────────────────────────────────────────────
 
     def train(self, df: pd.DataFrame) -> Dict:
-        """Train ensemble and auto-calibrate shrinkage."""
+        """
+        Train ensemble and auto-calibrate shrinkage.
+        Loads persisted tuned params if available, otherwise uses defaults.
+        Uses adaptive bias correction.
+        """
+        saved = load_best_params()
+        if saved:
+            self.hyperparams = saved
+        return self._train_with_params(df, saved)
+
+    def tune_and_train(
+        self,
+        df: pd.DataFrame,
+        n_trials: int = TUNING_N_TRIALS,
+        timeout: int = TUNING_TIMEOUT,
+        progress_callback=None,
+    ) -> Dict:
+        """
+        Run Optuna hyperparameter tuning, then train with best params.
+        Uses adaptive bias correction.
+        """
+        tuning_result = run_tuning(
+            df,
+            n_trials=n_trials,
+            timeout=timeout,
+            callback=progress_callback,
+        )
+        self.tuning_results = tuning_result
+        best = tuning_result["best_params"]
+        save_best_params(best)
+        self.hyperparams = best
+        return self._train_with_params(df, best)
+
+    def _train_with_params(self, df: pd.DataFrame, params: Optional[Dict]) -> Dict:
+        """Internal: train with specified params (or defaults if None)."""
         X, y_chg, y_abs, bases, names, fdf = self._prep(df)
 
         if len(X) < MIN_TRAINING_WEEKS:
             raise ValueError(f"Need {MIN_TRAINING_WEEKS} weeks, got {len(X)}.")
 
+        resolved = self._resolve_params(params)
+        xgb_p = resolved["xgb_params"]
+        ridge_alpha = resolved["ridge_alpha"]
+        top_n = resolved["top_n"]
+        recent_frac = resolved["recent_frac"]
+        self.ew = resolved["ew"]
+
         self.all_features = names
-        sw = _sample_weights(len(X))
+        sw = _sample_weights(len(X), recent_frac)
 
         # ── Fit 3 models on ALL data ──────────────────────────────────────
-        self.xgb_full = XGBRegressor(**XGBOOST_PARAMS)
+        self.xgb_full = XGBRegressor(**xgb_p)
         self.xgb_full.fit(X, y_chg, sample_weight=sw, verbose=False)
 
-        self.sel_features = _top_features(X, y_chg, names, top_n=35)
+        self.sel_features = _top_features(
+            X, y_chg, names, top_n=top_n, xgb_params=xgb_p
+        )
 
-        self.xgb_sel = XGBRegressor(**XGBOOST_PARAMS)
+        self.xgb_sel = XGBRegressor(**xgb_p)
         self.xgb_sel.fit(
             X[self.sel_features], y_chg, sample_weight=sw, verbose=False
         )
 
         self.scaler = StandardScaler()
         Xsc = self.scaler.fit_transform(X[self.sel_features])
-        self.ridge = Ridge(alpha=1.0)
+        self.ridge = Ridge(alpha=ridge_alpha)
         self.ridge.fit(Xsc, y_chg, sample_weight=sw)
 
         self.is_trained = True
 
-        # ── Calibrate shrinkage on the most recent ~1 year ────────────────
-        cal_n = min(52, len(X) // 4)
-        cal_sl = slice(len(X) - cal_n, None)
-        raw_cal = self._raw_ensemble(X.iloc[cal_sl])
-        self.shrinkage = _calibrate_shrinkage(
-            raw_cal, y_abs.values[cal_sl], bases.values[cal_sl]
+        # ── Adaptive bias correction ──────────────────────────────────────
+        raw_all = self._raw_ensemble(X)
+        self.shrinkage, self.bias, self.bias_metadata = (
+            self.bias_tracker.compute_adaptive_bias(
+                raw_all, y_abs.values, bases.values
+            )
         )
 
-        # ── Calibrate bias (mean residual after shrinkage) ────────────────
-        dampened_cal = raw_cal * self.shrinkage
-        pred_cal = bases.values[cal_sl] + dampened_cal
-        self.bias = float(np.mean(pred_cal - y_abs.values[cal_sl]))
-
         # ── In-sample metrics (with shrinkage applied) ────────────────────
-        raw_all = self._raw_ensemble(X)
         final_chg = raw_all * self.shrinkage - self.bias
         pred_abs_all = bases.values + final_chg
 
@@ -203,7 +292,20 @@ class GasPriceModel:
             "n_features": len(names),
             "n_selected_features": len(self.sel_features),
             "trained_at": datetime.now().isoformat(),
+            "tuned": params is not None and "xgb_params" in (params or {}),
+            "ensemble_weights": [round(w, 3) for w in self.ew],
         }
+
+        # Add bias metadata
+        if self.bias_metadata:
+            for k, v in self.bias_metadata.items():
+                self.metrics[f"bias_{k}"] = v
+
+        # Add tuning results if available
+        if self.tuning_results:
+            self.metrics["tuning_best_value"] = self.tuning_results["best_value"]
+            self.metrics["tuning_n_trials"] = self.tuning_results["n_trials"]
+
         return self.metrics
 
     # ─── Walk-Forward Validation ──────────────────────────────────────────
@@ -211,12 +313,17 @@ class GasPriceModel:
     def walk_forward_validate(self, df: pd.DataFrame) -> Tuple[Dict, pd.DataFrame]:
         """
         Walk-forward validation with per-step shrinkage calibration.
-        At each step:
-          1. Train ensemble on expanding window
-          2. Calibrate shrinkage on last 26 weeks of training data
-          3. Predict next week's change with shrinkage applied
+        Uses tuned hyperparameters if available.
         """
         X, y_chg, y_abs, bases, names, fdf = self._prep(df)
+
+        # Resolve params (use tuned if set during train/tune_and_train)
+        resolved = self._resolve_params(self.hyperparams)
+        xgb_p = resolved["xgb_params"]
+        ridge_alpha = resolved["ridge_alpha"]
+        top_n = resolved["top_n"]
+        recent_frac = resolved["recent_frac"]
+        ew = resolved["ew"]
 
         n = len(X)
         test_n = min(VALIDATION_WEEKS, n // 3)
@@ -234,20 +341,20 @@ class GasPriceModel:
         for i in range(test_start, n):
             Xtr, ytr = X.iloc[:i], y_chg.iloc[:i]
             btr, atr = bases.iloc[:i], y_abs.iloc[:i]
-            sw = _sample_weights(len(Xtr))
+            sw = _sample_weights(len(Xtr), recent_frac)
 
             # Fit 3 models
-            sel = _top_features(Xtr, ytr, names, top_n=35)
+            sel = _top_features(Xtr, ytr, names, top_n=top_n, xgb_params=xgb_p)
 
-            m1 = XGBRegressor(**XGBOOST_PARAMS)
+            m1 = XGBRegressor(**xgb_p)
             m1.fit(Xtr, ytr, sample_weight=sw, verbose=False)
 
-            m2 = XGBRegressor(**XGBOOST_PARAMS)
+            m2 = XGBRegressor(**xgb_p)
             m2.fit(Xtr[sel], ytr, sample_weight=sw, verbose=False)
 
             sc = StandardScaler()
             Xsc = sc.fit_transform(Xtr[sel])
-            m3 = Ridge(alpha=1.0)
+            m3 = Ridge(alpha=ridge_alpha)
             m3.fit(Xsc, ytr, sample_weight=sw)
 
             # Raw ensemble on calibration window (last 26 weeks of train)
@@ -257,7 +364,7 @@ class GasPriceModel:
             p1c = m1.predict(Xtr.iloc[cal_sl])
             p2c = m2.predict(Xtr.iloc[cal_sl][sel])
             p3c = m3.predict(sc.transform(Xtr.iloc[cal_sl][sel]))
-            raw_cal = self.ew[0] * p1c + self.ew[1] * p2c + self.ew[2] * p3c
+            raw_cal = ew[0] * p1c + ew[1] * p2c + ew[2] * p3c
 
             # Calibrate shrinkage on calibration window
             shrink = _calibrate_shrinkage(
@@ -273,7 +380,7 @@ class GasPriceModel:
             p1 = m1.predict(X_test)[0]
             p2 = m2.predict(X_test[sel])[0]
             p3 = m3.predict(sc.transform(X_test[sel]))[0]
-            raw = self.ew[0] * p1 + self.ew[1] * p2 + self.ew[2] * p3
+            raw = ew[0] * p1 + ew[1] * p2 + ew[2] * p3
 
             final_chg = raw * shrink - bias
             pred = bases.iloc[i] + final_chg
