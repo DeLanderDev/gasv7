@@ -36,7 +36,8 @@ from config import (
     MIN_TRAINING_WEEKS,
     MODEL_FILE,
     TUNING_N_TRIALS,
-    TUNING_TIMEOUT,
+    TUNING_TIMEOUT_PER_TRIAL,
+    TUNING_MAX_TIMEOUT,
     VALIDATION_WEEKS,
     XGBOOST_PARAMS,
 )
@@ -213,7 +214,7 @@ class GasPriceModel:
         self,
         df: pd.DataFrame,
         n_trials: int = TUNING_N_TRIALS,
-        timeout: int = TUNING_TIMEOUT,
+        timeout: int = min(TUNING_N_TRIALS * TUNING_TIMEOUT_PER_TRIAL, TUNING_MAX_TIMEOUT),
         progress_callback=None,
     ) -> Dict:
         """
