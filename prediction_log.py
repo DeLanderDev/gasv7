@@ -39,6 +39,7 @@ LOG_COLUMNS = [
     "error",                # Filled in later: predicted - actual
     "abs_error",            # Filled in later: |error|
     "save_type",            # "manual" or "scheduled"
+    "prediction_type",      # "next_sunday" or "end_of_month"
 ]
 
 
@@ -91,6 +92,7 @@ def save_prediction(display: Dict, prediction: Dict, save_type: str = "manual") 
         "error": "",
         "abs_error": "",
         "save_type": save_type,
+        "prediction_type": prediction.get("prediction_type", "next_sunday"),
     }
 
     with open(PREDICTION_LOG_FILE, "a", newline="") as f:
