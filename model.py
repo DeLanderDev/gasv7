@@ -13,9 +13,11 @@ Key design decisions:
   6. Adaptive bias correction with regime detection
 """
 
+import calendar
 import json
 import warnings
 from datetime import datetime, timedelta
+from math import sqrt
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -511,6 +513,84 @@ class GasPriceModel:
                     self.scaler.transform(row[self.sel_features])
                 )[0]
             ), 5),
+        }
+
+    def predict_end_of_month(self, df: pd.DataFrame) -> Dict:
+        """Predict the gas price on the last day of the current month.
+
+        Reuses the weekly prediction from predict_next_week() and scales
+        the predicted change proportionally by days remaining in the month.
+        Confidence intervals grow with sqrt(time).
+        """
+        weekly = self.predict_next_week(df)
+
+        today = datetime.now()
+        last_day = calendar.monthrange(today.year, today.month)[1]
+        eom_date = datetime(today.year, today.month, last_day)
+
+        days_to_eom = (eom_date - today).days
+        if days_to_eom <= 0:
+            days_to_eom = 1  # edge case: today is last day of month
+
+        next_sun_date = datetime.strptime(weekly["prediction_date"], "%Y-%m-%d")
+        days_to_sunday = (next_sun_date - today).days
+
+        # If end of month is within the next week, just relabel the date
+        if days_to_eom <= days_to_sunday:
+            result = dict(weekly)
+            result["prediction_date"] = eom_date.strftime("%Y-%m-%d")
+            result["prediction_day"] = eom_date.strftime("%A, %B %d, %Y")
+            result["prediction_type"] = "end_of_month"
+            result["scaling_factor"] = 1.0
+            result["weekly_change"] = weekly["predicted_change"]
+            return result
+
+        # Scale weekly change proportionally
+        scale = days_to_eom / 7.0
+        weekly_change = weekly["predicted_change"]
+        scaled_change = weekly_change * scale
+
+        current_price = weekly["current_price"]
+        eom_prediction = current_price + scaled_change
+        eom_pct_change = (scaled_change / current_price) * 100
+
+        # Uncertainty grows with sqrt of time
+        std_err = weekly["std_error"]
+        scaled_std_err = std_err * sqrt(days_to_eom / 7.0)
+
+        ci_68 = (eom_prediction - scaled_std_err, eom_prediction + scaled_std_err)
+        ci_95 = (eom_prediction - 1.96 * scaled_std_err,
+                 eom_prediction + 1.96 * scaled_std_err)
+
+        direction = (
+            "UP" if scaled_change > 0.001
+            else ("DOWN" if scaled_change < -0.001 else "FLAT")
+        )
+
+        return {
+            "prediction": round(eom_prediction, 4),
+            "raw_prediction": weekly["raw_prediction"],
+            "predicted_change": round(scaled_change, 4),
+            "raw_change": weekly["raw_change"],
+            "current_price": current_price,
+            "current_date": weekly["current_date"],
+            "predicted_pct_change": round(eom_pct_change, 3),
+            "direction": direction,
+            "ci_68_low": round(ci_68[0], 4),
+            "ci_68_high": round(ci_68[1], 4),
+            "ci_95_low": round(ci_95[0], 4),
+            "ci_95_high": round(ci_95[1], 4),
+            "std_error": round(scaled_std_err, 4),
+            "shrinkage": weekly["shrinkage"],
+            "direction_accuracy": weekly["direction_accuracy"],
+            "prediction_date": eom_date.strftime("%Y-%m-%d"),
+            "prediction_day": eom_date.strftime("%A, %B %d, %Y"),
+            "model_1_change": weekly["model_1_change"],
+            "model_2_change": weekly["model_2_change"],
+            "model_3_change": weekly["model_3_change"],
+            "prediction_type": "end_of_month",
+            "scaling_factor": round(scale, 3),
+            "weekly_change": weekly["predicted_change"],
         }
 
     # ─── Feature Importance ───────────────────────────────────────────────

@@ -89,6 +89,16 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("⚙️ Settings")
 
+    prediction_target = st.radio(
+        "Prediction target",
+        options=["Next Sunday", "End of Month"],
+        index=0,
+        horizontal=True,
+        help="Next Sunday predicts the weekly change. "
+             "End of Month scales the weekly change to estimate the price "
+             "on the last day of the current month.",
+    )
+
     history_years = st.slider(
         "History (years)", min_value=2, max_value=10,
         value=DEFAULT_HISTORY_YEARS,
@@ -280,10 +290,20 @@ if run_validation:
 
 # ─── Prediction ───────────────────────────────────────────────────────────────
 try:
-    prediction = model.predict_next_week(data)
+    if prediction_target == "End of Month":
+        prediction = model.predict_end_of_month(data)
+    else:
+        prediction = model.predict_next_week(data)
 except Exception as e:
     st.error(f"❌ Error generating prediction: {str(e)}")
     st.stop()
+
+if prediction.get("scaling_factor", 1.0) > 2.0:
+    st.warning(
+        f"⚠️ The end-of-month target is {int(prediction['scaling_factor'] * 7)} days away. "
+        f"This prediction extrapolates beyond the model's weekly horizon. "
+        f"Treat with caution."
+    )
 
 # ─── AAA Price Adjustment ────────────────────────────────────────────────────
 use_aaa = aaa_price > 0.0
@@ -377,17 +397,26 @@ dir_color = (
     "#ff6b6b" if display["direction"] == "UP"
     else ("#51cf66" if display["direction"] == "DOWN" else "#ffd43b")
 )
+target_label = "by" if prediction_target == "End of Month" else "by Sunday"
 summary = (
     f"### Prediction Summary\n"
     f"The model predicts gas prices will go "
     f"**<span style='color:{dir_color}'>{display['predicted_change']:+.3f}/gal "
     f"({display['direction']})</span>** "
-    f"by Sunday **{display['prediction_day']}**, "
+    f"{target_label} **{display['prediction_day']}**, "
     f"from ${display['current_price']:.3f} → "
     f"**${display['prediction']:.3f}** per gallon.  \n"
     f"95% confidence interval: "
     f"${display['ci_95_low']:.3f} – ${display['ci_95_high']:.3f}"
 )
+if prediction.get("prediction_type") == "end_of_month" and prediction.get("scaling_factor", 1.0) != 1.0:
+    summary += (
+        f"  \n\n*End-of-month estimate: weekly change of "
+        f"{prediction.get('weekly_change', 0):+.3f} scaled by "
+        f"{prediction.get('scaling_factor', 1.0):.1f}x "
+        f"({int(prediction['scaling_factor'] * 7)} days). "
+        f"Confidence intervals widened accordingly.*"
+    )
 if use_aaa:
     summary += (
         f"  \n\n*Based on AAA price ${aaa_price:.3f} + model-predicted change "
